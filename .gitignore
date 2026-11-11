@@ -1,0 +1,6 @@
+flasher/assets/
+build/
+dist/
+fw/
+__pycache__/
+*.spec

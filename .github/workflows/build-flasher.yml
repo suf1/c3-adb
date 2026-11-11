@@ -1,0 +1,107 @@
+name: Build flasher exe
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1"          # weekly: fresh firmware + fresh blocklist inside the exe
+  push:
+    branches: [main]
+    paths: ["flasher/**", "ci/**", ".github/workflows/build-flasher.yml"]
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: 9M2PJU/9M2PJU-ESP32-C3-AdBlocker
+  UPSTREAM_REF: main
+  PIO_ENV: c3-single
+  BLOCKLIST_SOURCES: "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt"
+  # Extra options for build_blocklist.py, e.g. a smaller Bloom filter (see its --help):
+  BLOCKLIST_EXTRA_ARGS: ""
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out firmware source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+          path: fw
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio esptool==4.8.1 pyserial pyinstaller
+
+      - name: Unit-test the firmware patcher
+        run: python tests/test_fwpatch.py
+
+      - name: Create placeholder secrets.h
+        run: python ci/make_secrets.py fw/src/secrets.example.h fw/src/secrets.h
+
+      - name: Build firmware (single-app)
+        run: pio run -d fw -e ${{ env.PIO_ENV }}
+
+      - name: Build blocklist
+        shell: bash
+        run: |
+          mkdir -p build
+          python fw/tools/build_blocklist.py build/blocklist.bin $BLOCKLIST_SOURCES $BLOCKLIST_EXTRA_ARGS
+          ls -l build/blocklist.bin
+
+      - name: Fit test + install mklittlefs (buildfs)
+        shell: bash
+        run: |
+          mkdir -p fw/data
+          cp build/blocklist.bin fw/data/blocklist.bin
+          pio run -d fw -e ${{ env.PIO_ENV }} -t buildfs
+
+      - name: Collect assets
+        run: python ci/collect_assets.py fw ${{ env.PIO_ENV }} build/blocklist.bin flasher/assets
+
+      - name: Verify Wi-Fi placeholders are in the firmware
+        run: >
+          python -c "import sys; sys.path.insert(0,'flasher'); import fwpatch;
+          d=open('flasher/assets/firmware.bin','rb').read();
+          assert fwpatch.SSID_SLOT in d and fwpatch.PASS_SLOT in d, 'Wi-Fi placeholders missing from firmware: the firmware does not embed secrets.h strings as literals';
+          print('placeholders present')"
+
+      - name: Self-test (from source)
+        run: python flasher/app.py --selftest
+
+      - name: Build exe
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name C3-AdBlock-Flasher
+          --paths flasher --add-data "flasher/assets;assets" --collect-all esptool
+          flasher/app.py
+
+      - name: Self-test (built exe)
+        shell: pwsh
+        run: |
+          $env:C3F_SELFTEST_OUT = "$PWD\selftest.txt"
+          $p = Start-Process -FilePath "dist\C3-AdBlock-Flasher.exe" -ArgumentList "--selftest" -Wait -PassThru
+          Get-Content selftest.txt
+          if ($p.ExitCode -ne 0) { throw "exe self-test failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: C3-AdBlock-Flasher
+          path: dist/C3-AdBlock-Flasher.exe
+          retention-days: 30
+
+      - name: Publish to rolling release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view flasher-latest >/dev/null 2>&1 || \
+            gh release create flasher-latest --title "Flasher (latest)" --notes "Auto-built. Download C3-AdBlock-Flasher.exe."
+          gh release upload flasher-latest dist/C3-AdBlock-Flasher.exe --clobber
